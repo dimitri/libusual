@@ -55,7 +55,7 @@ clean:
 	rm -rf autom4te*
 
 distclean: clean
-	rm -f config.mak usual/config.h
+	rm -f config.mak usual/config.h config.status
 
 boot:
 	rm -rf usual/config.*
