@@ -24,26 +24,14 @@
 
 #include <usual/event.h>
 
-#include <usual/base.h>
-#include <usual/compat.h>
+#ifndef HAVE_LIBEVENT
 
-#ifdef HAVE_SYS_SOCKET_H
-#include <sys/socket.h>
-#endif
-#ifdef HAVE_POLL_H
-#include <poll.h>
-#endif
-
-
-#include <errno.h>
-#include <signal.h>
 #include <string.h>
-#include <unistd.h>
-#include <stdlib.h>
 
 #include <usual/statlist.h>
 #include <usual/socket.h>
-#include <usual/alloc.h>
+#include <usual/signal.h>
+#include <usual/heap.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -61,17 +49,10 @@
 /* extra event flag to track if event is added */
 #define EV_ACTIVE 0x80
 
-/* load heap code */
-static inline bool ev_smaller_timeout(struct event *ev1, struct event *ev2);
-static inline void ev_save_pos(struct event *ev, int pos);
-#define IS_BETTER(ev1, ev2) ev_smaller_timeout(ev1, ev2)
-#define SAVE_POS(ev, pos) ev_save_pos(ev, pos)
-#include <usual/heap-impl.h>
-
 
 struct event_base {
 	/* pending timeouts */
-	struct Heap timeout_heap;
+	struct Heap *timeout_heap;
 
 	/* fd events */
 	struct StatList fd_list;
@@ -98,7 +79,7 @@ struct event_base {
 };
 
 /* default event base */
-static struct event_base *current_base = NULL;
+static struct event_base *current_base;
 
 /* global signal data */
 static volatile unsigned int sig_count[MAX_SIGNAL];
@@ -130,7 +111,7 @@ static void base_dbg(struct event_base *base, const char *s, ...)
 
 	log_noise("event base=%p: fdlist=%u timeouts=%d pfds=%d: %s",
 	       base, statlist_count(&base->fd_list),
-	       base->timeout_heap.used,
+	       heap_size(base->timeout_heap),
 	       base->pfd_size, buf);
 }
 
@@ -187,13 +168,15 @@ static usec_t convert_timeout(struct event_base *base, struct timeval *tv)
 	return val;
 }
 
-static inline bool ev_smaller_timeout(struct event *ev1, struct event *ev2)
+static bool ev_is_better(const void *a, const void *b)
 {
+	const struct event *ev1 = a, *ev2 = b;
 	return ev1->timeout_val < ev2->timeout_val;
 }
 
-static inline void ev_save_pos(struct event *ev, int pos)
+static void ev_save_pos(void *obj, unsigned pos)
 {
+	struct event *ev = obj;
 	ev->timeout_idx = pos;
 }
 
@@ -230,6 +213,14 @@ static bool make_room(struct event_base *base, int need)
  * Single base functions.
  */
 
+struct event_base *event_init(void)
+{
+	struct event_base *base = event_base_new();
+	if (!current_base)
+		current_base = base;
+	return base;
+}
+
 int event_loop(int loop_flags)
 {
 	return event_base_loop(current_base, loop_flags);
@@ -259,15 +250,21 @@ int event_loopexit(struct timeval *timeout)
  * Event base initialization.
  */
 
-struct event_base *event_init(void)
+struct event_base *event_base_new(void)
 {
 	struct event_base *base;
 	int i;
 
-	base = zmalloc(sizeof(*base));
+	base = calloc(1, sizeof(*base));
+	if (!base)
+		return NULL;
 
 	/* initialize timeout and fd areas */
-	heap_init(&base->timeout_heap);
+	base->timeout_heap = heap_create(ev_is_better, ev_save_pos, USUAL_ALLOC);
+	if (!base->timeout_heap) {
+		free(base);
+		return NULL;
+	}
 	statlist_init(&base->fd_list, "fd_list");
 
 	/* initialize signal areas */
@@ -281,9 +278,6 @@ struct event_base *event_init(void)
 		event_base_free(base);
 		return NULL;
 	}
-
-	if (!current_base)
-		current_base = base;
 	return base;
 }
 
@@ -296,7 +290,7 @@ void event_base_free(struct event_base *base)
 	}
 	if (base == current_base)
 		current_base = NULL;
-	heap_destroy(&base->timeout_heap);
+	heap_destroy(base->timeout_heap);
 	free(base->pfd_event);
 	free(base->pfd_list);
 	sig_close(base);
@@ -319,6 +313,9 @@ void event_assign(struct event *ev, struct event_base *base, int fd, short flags
 {
 	Assert(base);
 	Assert((ev->flags & EV_ACTIVE) == 0);
+
+	if (base == NULL)
+		base = current_base;
 
 	ev->fd = fd;
 	ev->base = base;
@@ -367,7 +364,7 @@ int event_del(struct event *ev)
 
 	/* remove from timeout tree */
 	if (ev->flags & EV_TIMEOUT) {
-		heap_delete_pos(&ev->base->timeout_heap, ev->timeout_idx);
+		heap_remove(ev->base->timeout_heap, ev->timeout_idx);
 		ev->flags &= ~EV_TIMEOUT;
 	}
 
@@ -396,8 +393,8 @@ int event_add(struct event *ev, struct timeval *timeout)
 	if (timeout) {
 		if (ev->flags & EV_PERSIST)
 			goto err_inval;
-		if (!heap_reserve(&base->timeout_heap, 1))
-			return false;
+		if (!heap_reserve(base->timeout_heap, 1))
+			return -1;
 	} else {
 		if (ev->flags & EV_TIMEOUT)
 			ev->flags &= ~EV_TIMEOUT;
@@ -420,7 +417,7 @@ int event_add(struct event *ev, struct timeval *timeout)
 	if (timeout) {
 		ev->timeout_val = convert_timeout(base, timeout);
 		ev->flags |= EV_TIMEOUT;
-		heap_insert(&base->timeout_heap, ev);
+		heap_push(base->timeout_heap, ev);
 	}
 	ev->ev_idx = -1;
 	ev->flags |= EV_ACTIVE;
@@ -451,7 +448,7 @@ static void deliver_event(struct event *ev, short flags)
 
 static inline struct event *get_smallest_timeout(struct event_base *base)
 {
-	return heap_get_top(&base->timeout_heap);
+	return heap_top(base->timeout_heap);
 }
 
 /* decide how long poll() should sleep */
@@ -592,7 +589,7 @@ loop:
  */
 
 /* global signal handler registered via sigaction() */
-static void uevent_sig_handler(int sig, siginfo_t *si, void *arg)
+static void uevent_sig_handler(int sig)
 {
 	struct List *node, *tmp;
 	struct event_base *base;
@@ -680,8 +677,8 @@ static bool sig_init(struct event_base *base, int sig)
 	if (!signal_set_up[sig]) {
 		struct sigaction sa;
 		memset(&sa, 0, sizeof(sa));
-		sa.sa_sigaction = uevent_sig_handler;
-		sa.sa_flags = SA_SIGINFO | SA_RESTART;
+		sa.sa_handler = uevent_sig_handler;
+		sa.sa_flags = SA_RESTART;
 		sigfillset(&sa.sa_mask);
 		if (sigaction(sig, &sa, &old_handler[sig]) != 0)
 			return false;
@@ -746,7 +743,7 @@ int event_base_once(struct event_base *base, int fd, short flags,
 		return -1;
 	}
 
-	once = zmalloc(sizeof(*once));
+	once = calloc(1, sizeof(*once));
 	if (!once)
 		return -1;
 
@@ -777,3 +774,18 @@ int event_base_loopexit(struct event_base *base, struct timeval *timeout)
 	return event_base_once(base, -1, 0, loopexit_handler, base, timeout);
 }
 
+/*
+ * Info
+ */
+
+const char *event_get_version(void)
+{
+	return "usual/event";
+}
+
+const char *event_get_method(void)
+{
+	return "poll";
+}
+
+#endif /* !HAVE_LIBEVENT */

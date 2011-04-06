@@ -1,7 +1,7 @@
 /*
- * Alloc helpers.
+ * Basic C environment.
  *
- * Copyright (c) 2009 Marko Kreen
+ * Copyright (c) 2007-2009 Marko Kreen
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,36 +14,40 @@
  * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- */ 
-
-#ifndef _USUAL_ALLOC_
-#define _USUAL_ALLOC_
+ */
 
 #include <usual/base.h>
 
-#include <stdlib.h>
+#if defined(HAVE_MALLOC_H) && defined(__darwin__)
+#include <malloc.h>
+#endif
 
-/*
- * Function: free
- *
- * Fix posix bug by accepting const pointer.
- */
-static inline void sane_free(const void *p)
+/* define posix_memalign() only when possible to emulate */
+#if !defined(HAVE_POSIX_MEMALIGN) \
+    && (defined(HAVE_MEMALIGN) || defined(HAVE_VALLOC))
+
+int posix_memalign(void **ptr_p, size_t align, size_t len)
 {
-	free((void *)p);
-}
-#define free(x) sane_free(x)
+	void *p;
+	int ret, old_errno = errno;
 
-/*
- * Function: zmalloc
- *
- * Zeroing malloc
- */
-_MUSTCHECK
-static inline void *zmalloc(size_t len)
-{
-	return calloc(1, len);
-}
+#ifdef HAVE_MEMALIGN
+	p = memalign(align, len);
+#else /* !HAVE_MEMALIGN */
+#ifdef HAVE_VALLOC
+	/* assuming less than pagesize alignment */
+	p = valloc(len);
+#endif /* !VALLOC */
+#endif /* !MEMALIGN */
 
+	*ptr_p = p;
+	if (p)
+		return 0;
+
+	/* on error restore old errno */
+	ret = errno;
+	errno = old_errno;
+	return ret;
+}
 #endif
 

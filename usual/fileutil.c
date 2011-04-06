@@ -16,10 +16,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */ 
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-
 #include <usual/fileutil.h>
 
 #ifdef HAVE_SYS_MMAN_H
@@ -27,18 +23,14 @@
 #endif
 
 #include <sys/stat.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <fcntl.h>
-
-#include <usual/compat.h>
+#include <string.h>
 
 /*
  * Load text file into C string.
  */
 
-char *load_file(const char *fn)
+void *load_file(const char *fn, size_t *len_p)
 {
 	struct stat st;
 	char *buf = NULL;
@@ -54,17 +46,22 @@ char *load_file(const char *fn)
 		return NULL;
 
 	f = fopen(fn, "r");
-	if (!f)
+	if (!f) {
+		free(buf);
 		return NULL;
+	}
 
 	if ((res = fread(buf, 1, st.st_size, f)) < 0) {
+		free(buf);
 		fclose(f);
 		return NULL;
 	}
 
 	fclose(f);
-	buf[st.st_size] = 0;
 
+	buf[res] = 0;
+	if (len_p)
+		*len_p = res;
 	return buf;
 }
 
@@ -78,17 +75,22 @@ bool foreach_line(const char *fn, procline_cb proc_line, void *arg)
 	size_t len = 0;
 	ssize_t res;
 	FILE *f = fopen(fn, "rb");
+	bool ok = false;
 	if (!f)
 		return false;
 	while (1) {
 		res = getline(&ln, &len, f);
-		if (res < 0)
+		if (res < 0) {
+			if (feof(f))
+				ok = true;
 			break;
-		proc_line(arg, ln, res);
+		}
+		if (!proc_line(arg, ln, res))
+			break;
 	}
 	fclose(f);
 	free(ln);
-	return true;
+	return ok;
 }
 
 /*
@@ -138,3 +140,38 @@ void unmap_file(struct MappedFile *m)
 }
 
 #endif
+
+
+#ifndef HAVE_GETLINE
+/*
+ * Read line from FILE with dynamic allocation.
+ */
+int getline(char **line_p, size_t *size_p, void *_f)
+{
+	FILE *f = _f;
+	char *p;
+	int len = 0;
+
+	if (!*line_p || *size_p < 128) {
+		p = realloc(*line_p, 512);
+		if (!p) return -1;
+		*line_p = p;
+		*size_p = 512;
+	}
+
+	while (1) {
+		p = fgets(*line_p + len, *size_p - len, f);
+		if (!p)
+			return len ? len : -1;
+		len += strlen(p);
+		if ((*line_p)[len - 1] == '\n')
+			return len;
+		p = realloc(*line_p, *size_p * 2);
+		if (!p)
+			return -1;
+		*line_p = p;
+		*size_p *= 2;
+	}
+}
+#endif
+

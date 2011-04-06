@@ -19,18 +19,13 @@
 
 #include <usual/daemon.h>
 
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <signal.h>
 #include <string.h>
 #include <stdio.h>
 
 #include <usual/logging.h>
-#include <usual/compat.h>
+#include <usual/signal.h>
 
 /*
  * pidfile management.
@@ -47,7 +42,15 @@ static void remove_pidfile(void)
 	g_pidfile = NULL;
 }
 
-static void check_pidfile(const char *pidfile)
+/*
+ * Reads pid from pidfile and sends a signal to it.
+ *
+ * true - signaling was successful.
+ * false - ENOENT / ESRCH
+ *
+ * fatal() otherwise.
+ */
+bool signal_pidfile(const char *pidfile, int sig)
 {
 	char buf[128 + 1];
 	struct stat st;
@@ -55,50 +58,63 @@ static void check_pidfile(const char *pidfile)
 	int fd, res;
 
 	if (!pidfile || !pidfile[0])
-		return;
+		return false;
 
+intr_loop:
 	/* check if pidfile exists */
-	if (stat(pidfile, &st) < 0) {
-		if (errno != ENOENT)
-			fatal_perror("stat");
-		return;
-	}
+	if (stat(pidfile, &st) < 0)
+		goto fail;
 
 	/* read old pid */
 	fd = open(pidfile, O_RDONLY);
 	if (fd < 0)
-		goto locked_pidfile;
+		goto fail;
 	res = read(fd, buf, sizeof(buf) - 1);
 	close(fd);
 	if (res <= 0)
-		goto locked_pidfile;
+		goto fail;
 
 	/* parse pid */
 	buf[res] = 0;
-	pid = atol(buf);
-	if (pid <= 0)
-		goto locked_pidfile;
+	errno = 0;
+	pid = strtoul(buf, NULL, 10);
+	if (errno) {
+		/* should we panic, or say no such process exists? */
+		if (0)
+			errno = ESRCH;
+		goto fail;
+	}
 
-	/* check if running */
-	if (kill(pid, 0) >= 0)
-		goto locked_pidfile;
-	if (errno != ESRCH)
-		goto locked_pidfile;
-
-	/* seems the pidfile is not in use */
-	log_info("Stale pidfile, removing");
-	unlink(pidfile);
-	return;
-
-locked_pidfile:
-	fatal("pidfile exists, another instance running?");
+	/* send the signal */
+	res = kill(pid, sig);
+	if (res == 0)
+		return true;
+fail:
+	/* decide error seriousness */
+	if (errno == EINTR)
+		goto intr_loop;
+	if (errno == ENOENT || errno == ESRCH)
+		return false;
+	fatal_perror("signal_pidfile: Unexpected error");
 }
 
-static void write_pidfile(const char *pidfile)
+static void check_pidfile(const char *pidfile)
+{
+	if (signal_pidfile(pidfile, 0))
+		fatal("pidfile exists, another instance running?");
+	if (errno == ESRCH) {
+		log_info("Stale pidfile, removing");
+		unlink(pidfile);
+	}
+}
+
+static void write_pidfile(const char *pidfile, bool first_write)
 {
 	char buf[64];
 	pid_t pid;
 	int res, fd, len;
+	static int atexit_hook = 0;
+	int flags = O_WRONLY | O_CREAT;
 
 	if (!pidfile || !pidfile[0])
 		return;
@@ -112,24 +128,31 @@ static void write_pidfile(const char *pidfile)
 	pid = getpid();
 	snprintf(buf, sizeof(buf), "%u\n", (unsigned)pid);
 
-	fd = open(pidfile, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	/* don't allow overwrite on first write */
+	if (first_write)
+		flags |= O_EXCL;
+
+	fd = open(pidfile, flags, 0644);
 	if (fd < 0)
-		fatal_perror("%s", pidfile);
+		fatal_perror("Cannot write pidfile: '%s'", pidfile);
 	len = strlen(buf);
 loop:
 	res = write(fd, buf, len);
 	if (res < 0) {
 		if (errno == EINTR)
 			goto loop;
-		fatal_perror("%s", pidfile);
+		fatal_perror("Write to pidfile failed: '%s'", pidfile);
 	} else if (res < len) {
 		len -= res;
 		goto loop;
 	}
 	close(fd);
 
-	/* only remove when we have it actually written */
-	atexit(remove_pidfile);
+	if (!atexit_hook) {
+		/* only remove when we have it actually written */
+		atexit(remove_pidfile);
+		atexit_hook = 1;
+	}
 }
 
 /*
@@ -148,15 +171,15 @@ void daemonize(const char *pidfile, bool go_background)
 
 	if (pidfile && pidfile[0]) {
 		check_pidfile(pidfile);
-		if (!go_background)
-			write_pidfile(pidfile);
+		/* write pidfile twice, to be able to show problems to user */
+		write_pidfile(pidfile, true);
 	} else if (go_background)
 		fatal("daemon needs pidfile configured");
 
 	if (!go_background)
 		return;
 
-	if (!cf_logfile && !cf_syslog_ident)
+	if ((!cf_logfile || !cf_logfile[0]) && !cf_syslog)
 		fatal("daemon needs logging configured");
 
 	/* send stdin, stdout, stderr to /dev/null */
@@ -188,6 +211,6 @@ void daemonize(const char *pidfile, bool go_background)
 	if (pid > 0)
 		_exit(0);
 
-	write_pidfile(pidfile);
+	write_pidfile(pidfile, false);
 }
 

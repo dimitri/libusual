@@ -16,21 +16,13 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-/*
- * Basic behaviour:
- * - On each alloc initializer is called.
- * - if init func is not given, memset() is done
- *
- * ATM custom 'align' larger than malloc() alignment does not work.
- */
-
 #include <usual/slab.h>
 
-#include <sys/param.h>
 #include <string.h>
-#include <stdlib.h>
 
 #include <usual/statlist.h>
+
+#ifndef USUAL_FAKE_SLAB
 
 /*
  * Store for pre-initialized objects of one type.
@@ -43,7 +35,9 @@ struct Slab {
 	unsigned final_size;
 	unsigned total_count;
 	slab_init_fn  init_func;
+	CxMem *cx;
 };
+
 
 /*
  * Header for each slab.
@@ -55,12 +49,24 @@ struct SlabFrag {
 /* keep track of all active slabs */
 static STATLIST(slab_list);
 
-/* cache for slab headers */
-static struct Slab *slab_headers = NULL;
+static void slab_list_append(struct Slab *slab)
+{
+#ifndef _REENTRANT
+	statlist_append(&slab_list, &slab->head);
+#endif
+}
+
+static void slab_list_remove(struct Slab *slab)
+{
+#ifndef _REENTRANT
+	statlist_remove(&slab_list, &slab->head);
+#endif
+}
 
 /* fill struct contents */
 static void init_slab(struct Slab *slab, const char *name, unsigned obj_size,
-		      unsigned align, slab_init_fn init_func)
+		      unsigned align, slab_init_fn init_func,
+		      CxMem *cx)
 {
 	unsigned slen = strlen(name);
 
@@ -69,7 +75,7 @@ static void init_slab(struct Slab *slab, const char *name, unsigned obj_size,
 	statlist_init(&slab->fraglist, name);
 	slab->total_count = 0;
 	slab->init_func = init_func;
-	statlist_append(&slab_list, &slab->head);
+	slab->cx = cx;
 
 	if (slen >= sizeof(slab->name))
 		slen = sizeof(slab->name) - 1;
@@ -80,27 +86,21 @@ static void init_slab(struct Slab *slab, const char *name, unsigned obj_size,
 		slab->final_size = ALIGN(obj_size);
 	else
 		slab->final_size = CUSTOM_ALIGN(obj_size, align);
+
+	slab_list_append(slab);
 }
 
 /* make new slab */
 struct Slab *slab_create(const char *name, unsigned obj_size, unsigned align,
-			 slab_init_fn init_func)
+			 slab_init_fn init_func,
+			 CxMem *cx)
 {
 	struct Slab *slab;
 
-	/* header cache */
-	if (!slab_headers) {
-		slab_headers = malloc(sizeof(struct Slab));
-		if (!slab_headers)
-			return NULL;
-		init_slab(slab_headers, "slab_header",
-			  sizeof(struct Slab), 0, NULL);
-	}
-
 	/* new slab object */
-	slab = slab_alloc(slab_headers);
+	slab = cx_alloc0(cx, sizeof(*slab));
 	if (slab)
-		init_slab(slab, name, obj_size, align, init_func);
+		init_slab(slab, name, obj_size, align, init_func, cx);
 	return slab;
 }
 
@@ -110,13 +110,15 @@ void slab_destroy(struct Slab *slab)
 	struct List *item, *tmp;
 	struct SlabFrag *frag;
 
+	if (!slab)
+		return;
+
+	slab_list_remove(slab);
 	statlist_for_each_safe(item, &slab->fraglist, tmp) {
 		frag = container_of(item, struct SlabFrag, head);
-		free(frag);
+		cx_free(slab->cx, frag);
 	}
-	statlist_remove(&slab_list, &slab->head);
-	memset(slab, 0, sizeof(*slab));
-	slab_free(slab_headers, slab);
+	cx_free(slab->cx, slab);
 }
 
 /* add new block of objects to slab */
@@ -135,12 +137,11 @@ static void grow(struct Slab *slab)
 	size = count * slab->final_size;
 
 	/* allocate & init */
-	frag = malloc(size + sizeof(struct SlabFrag));
+	frag = cx_alloc0(slab->cx, size + sizeof(struct SlabFrag));
 	if (!frag)
 		return;
 	list_init(&frag->head);
 	area = (char *)frag + sizeof(struct SlabFrag);
-	memset(area, 0, size);
 
 	/* init objects */
 	for (i = 0; i < count; i++) {
@@ -216,3 +217,68 @@ void slab_stats(slab_stat_fn cb_func, void *cb_arg)
 	}
 }
 
+#else
+
+struct Slab {
+	int size;
+	struct StatList obj_list;
+	slab_init_fn init_func;
+	CxMem *cx;
+};
+
+
+struct Slab *slab_create(const char *name, unsigned obj_size, unsigned align,
+			     slab_init_fn init_func,
+			     CxMem *cx)
+{
+	struct Slab *s = cx_alloc(cx, sizeof(*s));
+	if (s) {
+		s->size = obj_size;
+		s->init_func = init_func;
+		s->cx = cx;
+		statlist_init(&s->obj_list, "obj_list");
+	}
+	return s;
+}
+
+void slab_destroy(struct Slab *slab)
+{
+	struct List *el, *tmp;
+	statlist_for_each_safe(el, &slab->obj_list, tmp) {
+		statlist_remove(&slab->obj_list, el);
+		cx_free(slab->cx, el);
+	}
+	cx_free(slab->cx, slab);
+}
+
+void *slab_alloc(struct Slab *slab)
+{
+	struct List *o;
+	void *res;
+	o = cx_alloc(slab->cx, sizeof(struct List) + slab->size);
+	if (!o)
+		return NULL;
+	list_init(o);
+	statlist_append(&slab->obj_list, o);
+	res = (void *)(o + 1);
+	if (slab->init_func)
+		slab->init_func(res);
+	return res;
+}
+
+void slab_free(struct Slab *slab, void *obj)
+{
+	if (obj) {
+		struct List *el = obj;
+		statlist_remove(&slab->obj_list, el - 1);
+		cx_free(slab->cx, el - 1);
+	}
+}
+
+int slab_total_count(const struct Slab *slab) { return 0; }
+int slab_free_count(const struct Slab *slab) { return 0; }
+int slab_active_count(const struct Slab *slab) { return 0; }
+void slab_stats(slab_stat_fn cb_func, void *cb_arg) {}
+
+
+#endif

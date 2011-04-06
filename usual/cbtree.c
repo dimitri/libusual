@@ -25,11 +25,7 @@
 
 #include <usual/cbtree.h>
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-#include <unistd.h>
+#include <usual/bits.h>
 
 /*
  * - Childs are either other nodes or user pointers.
@@ -48,11 +44,14 @@ struct Node {
 
 struct CBTree {
 	struct Node *root;
-	const char *(*get_key)(void *obj);
+	cbtree_getkey_func obj_key_cb;
+	cbtree_walker_func obj_free_cb;
+	void *cb_ctx;
+
+	CxMem *cx;
 };
 
 #define SAME_KEY 0xFFFFFFFF
-
 
 /*
  * Low-level operations.
@@ -77,7 +76,7 @@ static inline void *get_external(void *extval)
 }
 
 /* get specific bit from string */
-static inline unsigned get_bit(unsigned bitpos, const char *key, unsigned klen)
+static inline unsigned get_bit(unsigned bitpos, const unsigned char *key, unsigned klen)
 {
 	unsigned pos = bitpos / 8;
 	unsigned bit = 7 - (bitpos % 8);
@@ -85,37 +84,52 @@ static inline unsigned get_bit(unsigned bitpos, const char *key, unsigned klen)
 }
 
 /* use callback to get key for a stored object */
-static inline const char *get_key(struct CBTree *tree, void *obj)
+static inline unsigned get_key(struct CBTree *tree, void *obj, const void **key_p)
 {
-	return tree->get_key(obj);
+	return tree->obj_key_cb(tree->cb_ctx, obj, key_p);
 }
 
-/* Find first differing bit on 2 zero-terminated strings.  */
-static unsigned find_crit_bit(const char *a, const char *b)
+/* check if object key matches argument */
+static inline bool key_matches(struct CBTree *tree, void *obj, const void *key, unsigned klen)
 {
-	unsigned i, c, pos;
+	const void *o_key;
+	unsigned o_klen;
+	o_klen = get_key(tree, obj, &o_key);
+	return (o_klen == klen) && (memcmp(key, o_key, klen) == 0);
+}
 
-	/* find differing byte */
-	for (i = 0; ; i++) {
-		/* this handles also size difference */
-		if (a[i] != b[i])
-			break;
+/* Find first differing bit on 2 strings.  */
+static unsigned find_crit_bit(const unsigned char *a, unsigned alen, const unsigned char *b, unsigned blen)
+{
+	unsigned i, c, pos, av, bv;
+	unsigned minlen = (alen > blen) ? blen : alen;
+	unsigned maxlen = (alen > blen) ? alen : blen;
 
-		/* equal strings? */
-		if (a[i] == 0)
-			return SAME_KEY;
+	/* find differing byte in common data */
+	for (i = 0; i < minlen; i++) {
+		av = a[i];
+		bv = b[i];
+		if (av != bv)
+			goto found;
 	}
 
+	/* find differing byte when one side is zero-filled */
+	for (; i < maxlen; i++) {
+		av = (i < alen) ? a[i] : 0;
+		bv = (i < blen) ? b[i] : 0;
+		if (av != bv)
+			goto found;
+	}
+	return SAME_KEY;
+
+found:
 	/* calculate bits that differ */
-	c = a[i] ^ b[i];
+	c = av ^ bv;
 
 	/* find the first one */
-	pos = i * 8;
-	while ((c & 0x80) == 0) {
-		c <<= 1;
-		pos++;
-	}
-	return pos;
+	pos = 8 - fls(c);
+
+	return i * 8 + pos;
 }
 
 
@@ -124,7 +138,7 @@ static unsigned find_crit_bit(const char *a, const char *b)
  */
 
 /* walk nodes until external pointer is found */
-static void *raw_lookup(struct CBTree *tree, const char *key, unsigned klen)
+static void *raw_lookup(struct CBTree *tree, const void *key, unsigned klen)
 {
 	struct Node *node = tree->root;
 	unsigned bit;
@@ -136,20 +150,18 @@ static void *raw_lookup(struct CBTree *tree, const char *key, unsigned klen)
 }
 
 /* actual lookup.  returns obj ptr or NULL of not found */
-void *cbtree_lookup(struct CBTree *tree, const char *key)
+void *cbtree_lookup(struct CBTree *tree, const void *key, unsigned klen)
 {
-	unsigned klen;
 	void *obj;
 
 	if (!tree->root)
 		return NULL;
 
 	/* find match based on bits we know about */
-	klen = strlen(key);
 	obj = raw_lookup(tree, key, klen);
 
 	/* need to check if the object actually matches */
-	if (strcmp(key, get_key(tree, obj)) == 0)
+	if (key_matches(tree, obj, key, klen))
 		return obj;
 
 	return NULL;
@@ -161,9 +173,9 @@ void *cbtree_lookup(struct CBTree *tree, const char *key)
  */
 
 /* node allocation */
-static struct Node *new_node(void)
+static struct Node *new_node(struct CBTree *tree)
 {
-	struct Node *node = malloc(sizeof(*node));
+	struct Node *node = cx_alloc(tree->cx, sizeof(*node));
 	memset(node, 0, sizeof(*node));
 	return node;
 }
@@ -176,7 +188,7 @@ static bool insert_first(struct CBTree *tree, void *obj)
 }
 
 /* insert into specific bit-position */
-static bool insert_at(struct CBTree *tree, unsigned newbit, const char *key, unsigned klen, void *obj)
+static bool insert_at(struct CBTree *tree, unsigned newbit, const void *key, unsigned klen, void *obj)
 {
 	/* location of current node/obj pointer under examination */
 	struct Node **pos = &tree->root;
@@ -189,7 +201,7 @@ static bool insert_at(struct CBTree *tree, unsigned newbit, const char *key, uns
 	}
 
 	bit = get_bit(newbit, key, klen);
-	node = new_node();
+	node = new_node(tree);
 	if (!node)
 		return false;
 	node->bitpos = newbit;
@@ -199,23 +211,25 @@ static bool insert_at(struct CBTree *tree, unsigned newbit, const char *key, uns
 	return true;
 }
 
-/* actual insert: returns true -> insert ok or key found, false -> malloc failure */
+/* actual insert: returns true -> insert ok or key found, false -> alloc failure */
 bool cbtree_insert(struct CBTree *tree, void *obj)
 {
-	const char *key;
-	unsigned newbit, klen;
+	const void *key, *old_key;
+	unsigned newbit, klen, old_klen;
 	void *old_obj;
 
 	if (!tree->root)
 		return insert_first(tree, obj);
 
-	/* match bits we know about */
-	key = get_key(tree, obj);
-	klen = strlen(key);
+	/* current key */
+	klen = get_key(tree, obj, &key);
+
+	/* nearest key in tree */
 	old_obj = raw_lookup(tree, key, klen);
+	old_klen = get_key(tree, old_obj, &old_key);
 
 	/* first differing bit is the target position */
-	newbit = find_crit_bit(key, get_key(tree, old_obj));
+	newbit = find_crit_bit(key, klen, old_key, old_klen);
 	if (newbit == SAME_KEY)
 		return true;
 	return insert_at(tree, newbit, key, klen, obj);
@@ -227,11 +241,10 @@ bool cbtree_insert(struct CBTree *tree, void *obj)
  */
 
 /* true -> object was found and removed, false -> not found */
-bool cbtree_delete(struct CBTree *tree, const char *key)
+bool cbtree_delete(struct CBTree *tree, const void *key, unsigned klen)
 {
 	void *obj, *tmp;
 	unsigned bit = 0;
-	unsigned klen = strlen(key);
 	/* location of current node/obj pointer under examination */
 	struct Node **pos = &tree->root;
 	/* if 'pos' has user obj, prev_pos has internal node pointing to it */
@@ -249,14 +262,17 @@ bool cbtree_delete(struct CBTree *tree, const char *key)
 
 	/* does the key actually matches */
 	obj = get_external(*pos);
-	if (strcmp(key, get_key(tree, obj)) != 0)
+	if (!key_matches(tree, obj, key, klen))
 		return false;
+
+	if (tree->obj_free_cb)
+		tree->obj_free_cb(tree->cb_ctx, obj);
 
 	/* drop the internal node pointing to our key */
 	if (prev_pos) {
 		tmp = *prev_pos;
 		*prev_pos = (*prev_pos)->child[bit ^ 1];
-		free(tmp);
+		cx_free(tree->cx, tmp);
 	} else {
 		tree->root = NULL;
 	}
@@ -267,31 +283,60 @@ bool cbtree_delete(struct CBTree *tree, const char *key)
  * Management.
  */
 
-/* create takes user function to query object for it's key */
-struct CBTree *cbtree_create(cbtree_getkey_func get_key_fn)
+struct CBTree *cbtree_create(cbtree_getkey_func obj_key_cb,
+			     cbtree_walker_func obj_free_cb,
+			     void *cb_ctx,
+			     CxMem *cx)
 {
-	struct CBTree *tree = malloc(sizeof(*tree));
+	struct CBTree *tree = cx_alloc(cx, sizeof(*tree));
+	if (!tree)
+		return NULL;
 	tree->root = NULL;
-	tree->get_key = get_key_fn;
+	tree->cb_ctx = cb_ctx;
+	tree->obj_key_cb = obj_key_cb;
+	tree->obj_free_cb = obj_free_cb;
+	tree->cx = cx;
 	return tree;
 }
 
 /* recursive freeing */
-static void destroy_node(struct Node *node)
+static void destroy_node(struct CBTree *tree, struct Node *node)
 {
-	if (is_node(node->child[0]))
-		destroy_node(node->child[0]);
-	if (is_node(node->child[1]))
-		destroy_node(node->child[1]);
-	free(node);
+	if (is_node(node)) {
+		destroy_node(tree, node->child[0]);
+		destroy_node(tree, node->child[1]);
+		cx_free(tree->cx, node);
+	} else if (tree->obj_free_cb) {
+		void *obj = get_external(node);
+		tree->obj_free_cb(tree->cb_ctx, obj);
+	}
 }
 
 /* Free tree and all it's internal nodes. */
 void cbtree_destroy(struct CBTree *tree)
 {
-	if (tree->root && is_node(tree->root))
-		destroy_node(tree->root);
+	if (tree->root)
+		destroy_node(tree, tree->root);
 	tree->root = NULL;
-	free(tree);
+	cx_free(tree->cx, tree);
+}
+
+/*
+ * walk over tree
+ */
+
+static bool walk(struct Node *node, cbtree_walker_func cb_func, void *cb_arg)
+{
+	if (!is_node(node))
+		return cb_func(cb_arg, get_external(node));
+	return walk(node->child[0], cb_func, cb_arg)
+	    && walk(node->child[1], cb_func, cb_arg);
+}
+
+bool cbtree_walk(struct CBTree *tree, cbtree_walker_func cb_func, void *cb_arg)
+{
+	if (!tree->root)
+		return true;
+	return walk(tree->root, cb_func, cb_arg);
 }
 

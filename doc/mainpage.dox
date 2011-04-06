@@ -1,0 +1,76 @@
+/**
+ * @mainpage
+ *
+ * @section libusual    libusual
+ *
+ * libusual is utility library.
+ *
+ * Unlike APR or GLIB which create their own API world, libusual
+ * tries to use standardized API's whenever possible.
+ *
+ * Goals for portability APIs:
+ * - Follow modern POSIX, BSD, glibc.  Make the APIs available everywhere.
+ * - If compat is impossible, allow the user code to compile - eg. UNIX
+ *   sockets on win32.
+ * - Assume cooparating user:
+ *   - libusual needs to implement only API that are used and useful.  No need try to provide full POSIX.
+ *   - user code survives gracefully when libusual provides less functionality.
+ *
+ * Goals for new APIs:
+ * - Simple, clear API
+ * - Simple, clear implementation.
+ * - It is preferable to have simple code which can be copied and modified
+ *   for some special case than complex code that tries to handle
+ *   everything at once.
+ *
+ * @section modules  Module list.
+ *
+ * <table>
+ * <tr><th colspan=2>  Compat includes  </th></tr>
+ * <tr><td>  <usual/base.h>          </td><td>  Base C environment  </td></tr>
+ * <tr><td>  <usual/ctype.h>         </td><td>  ctype compat  </td></tr>
+ * <tr><td>  <usual/getopt.h>        </td><td>  Command line argument processing  </td></tr>
+ * <tr><td>  <usual/err.h>           </td><td>  Error handling for command-line tools  </td></tr>
+ * <tr><td>  <usual/netdb.h>         </td><td>  Async DNS lookup  </td></tr>
+ * <tr><td>  <usual/pthread.h>       </td><td>  Pthreads compat   </td></tr>
+ * <tr><td>  <usual/signal.h>        </td><td>  Signal compat   </td></tr>
+ * <tr><td>  <usual/socket.h>        </td><td>  Socket compat and helper functions   </td></tr>
+ * <tr><td>  <usual/string.h>        </td><td>  String compat and helper functions   </td></tr>
+ * <tr><td>  <usual/time.h>          </td><td>  Time compat and helper functions   </td></tr>
+ * <tr><th colspan=2>  Data Structures  </th></tr>
+ * <tr><td>  <usual/aatree.h>        </td><td>  Binary Tree   </td></tr>
+ * <tr><td>  <usual/cbtree.h>        </td><td>  Crit-Bit Tree   </td></tr>
+ * <tr><td>  <usual/hashtab-impl.h>  </td><td>  Hash table   </td></tr>
+ * <tr><td>  <usual/heap.h>          </td><td>  Binary heap   </td></tr>
+ * <tr><td>  <usual/list.h>          </td><td>  Double-linked list   </td></tr>
+ * <tr><td>  <usual/mbuf.h>          </td><td>  Memory buffer   </td></tr>
+ * <tr><td>  <usual/mdict.h          </td><td>  Minimal dict   </td></tr>
+ * <tr><td>  <usual/shlist.h>        </td><td>  Double-linked list for shared mem   </td></tr>
+ * <tr><td>  <usual/statlist.h>      </td><td>  List with stats   </td></tr>
+ * <tr><td>  <usual/strpool.h>       </td><td>  Refcounted strings   </td></tr>
+ * <tr><th colspan=2>  Data Processing  </th></tr>
+ * <tr><td>  <usual/bits.h>          </td><td>  Bit arithmetic   </td></tr>
+ * <tr><td>  <usual/cfparser.h>      </td><td>  Config parser   </td></tr>
+ * <tr><td>  <usual/crc32.h>         </td><td>  CRC32   </td></tr>
+ * <tr><td>  <usual/endian.h>        </td><td>  Endianess conversion   </td></tr>
+ * <tr><td>  <usual/lookup3.h>       </td><td>  Jenkins' lookup3 hash   </td></tr>
+ * <tr><td>  <usual/misc.h>          </td><td>  Misc arithmetic   </td></tr>
+ * <tr><td>  <usual/md5.h>           </td><td>  MD5 hash   </td></tr>
+ * <tr><td>  <usual/sha1.h>          </td><td>  SHA1 hash   </td></tr>
+ * <tr><td>  <usual/regex.h>         </td><td>  POSIX regex compat   </td></tr>
+ * <tr><td>  <usual/pgutil.h>        </td><td>  PostgreSQL data formats   </td></tr>
+ * <tr><td>  <usual/utf8.h>          </td><td>  Low-level UTF8 handling   </td></tr>
+ * <tr><th colspan=2>  Memory Allocation  </th></tr>
+ * <tr><td>  <usual/cxalloc.h>       </td><td>  Context Allocator framework   </td></tr>
+ * <tr><td>  <usual/cxextra.h>       </td><td>  Extra allocators   </td></tr>
+ * <tr><td>  <usual/mempool.h>       </td><td>  Simple append-only memory pool   </td></tr>
+ * <tr><td>  <usual/slab.h>          </td><td>  Slab allocator for same-size objects   </td></tr>
+ * <tr><th colspan=2>  OS support  </th></tr>
+ * <tr><td>  <usual/event.h>         </td><td>  libevent compat   </td></tr>
+ * <tr><td>  <usual/daemon.h>        </td><td>  Process daemonization   </td></tr>
+ * <tr><td>  <usual/fileutil.h>      </td><td>  Various file I/O tools   </td></tr>
+ * <tr><td>  <usual/logging.h>       </td><td>  Logging framework for daemons   </td></tr>
+ * <tr><td>  <usual/pgsocket.h>      </td><td>  Async Postgres connection framework   </td></tr>
+ * <tr><td>  <usual/safeio.h>        </td><td>  Safety wrappers around OS I/O   </td></tr>
+ * </table>
+ */
